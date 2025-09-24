@@ -3,6 +3,27 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+
+class DisjointSet:
+    def __init__(self) -> None:
+        self.parent: Dict[int, int] = {}
+
+    def find(self, item: int) -> int:
+        parent = self.parent.setdefault(item, item)
+        if parent != item:
+            self.parent[item] = self.find(parent)
+        return self.parent[item]
+
+    def union(self, a: int, b: int) -> None:
+        pa = self.find(a)
+        pb = self.find(b)
+        if pa == pb:
+            return
+        if pa < pb:
+            self.parent[pb] = pa
+        else:
+            self.parent[pa] = pb
+
 from .data import Graph, Node
 
 DEFAULT_CAPACITIES: Dict[str, int] = {
@@ -62,13 +83,24 @@ class GreedyMemoryAwareScheduler:
                     continue
                 self.remaining_uses[buf_id] = self.remaining_uses.get(buf_id, 0) + 1
 
+        self.buffer_users: Dict[int, List[int]] = {}
+        for node in graph.nodes.values():
+            for buf_id in self._node_buffers(node):
+                self.buffer_users.setdefault(buf_id, []).append(node.id)
+
+        # Capacity bookkeeping (needed for tile heuristics).
+        slack_factor = max(0.1, self.config.capacity_slack * self._strategy_slack_factor())
+        self.capacities = {
+            cache: max(1, int(cap * slack_factor))
+            for cache, cap in self.config.capacities.items()
+        }
+        self.global_limit = sum(self.capacities.values()) if self.capacities else None
+        self.current_usage: Dict[str, int] = {cache: 0 for cache in self.capacities}
+        self.total_usage = 0
+
         # Tile bookkeeping.
         self.tile_types = self._tile_types_for_strategy()
-        self.tile_of_buf: Dict[int, int] = {
-            buf_id: buf_id
-            for buf_id, buf_type in self.buf_types.items()
-            if buf_type in self.tile_types
-        }
+        self.tile_of_buf: Dict[int, int] = self._compute_tile_components()
         self.node_tile: Dict[int, Optional[int]] = {}
         self.tile_remaining: Dict[int, int] = {}
         for nid, node in graph.nodes.items():
@@ -82,15 +114,8 @@ class GreedyMemoryAwareScheduler:
             key=lambda tile: self.buf_alloc_index.get(tile, self.total_allocs),
         )
         self.tile_cursor = 0
-
-        # Capacity bookkeeping.
-        self.capacities = {
-            cache: max(1, int(cap * self.config.capacity_slack))
-            for cache, cap in self.config.capacities.items()
-        }
-        self.global_limit = sum(self.capacities.values()) if self.capacities else None
-        self.current_usage: Dict[str, int] = {cache: 0 for cache in self.capacities}
-        self.total_usage = 0
+        self.tile_sizes: Dict[int, int] = self._compute_tile_sizes()
+        self.conv_mode: Optional[str] = self._select_conv_mode()
 
     # ------------------------------------------------------------------
     # Public API
@@ -173,6 +198,8 @@ class GreedyMemoryAwareScheduler:
         current_resident: int,
         current_tile: Optional[int],
     ) -> List[int]:
+        if self.strategy == "conv":
+            return ready
         if current_tile is None:
             return ready
         tile_candidates = [
@@ -183,6 +210,19 @@ class GreedyMemoryAwareScheduler:
         return tile_candidates if tile_candidates else ready
 
     def _current_tile(self) -> Optional[int]:
+        if self.strategy == "conv":
+            active_tiles = [tile for tile, remain in self.tile_remaining.items() if remain > 0]
+            if not active_tiles:
+                return None
+            if self.conv_mode == "depth":
+                return max(
+                    active_tiles,
+                    key=lambda tile: (
+                        self.tile_sizes.get(tile, 0),
+                        -self.buf_alloc_index.get(tile, self.total_allocs),
+                    ),
+                )
+            return min(active_tiles, key=lambda tile: self.buf_alloc_index.get(tile, self.total_allocs))
         while self.tile_cursor < len(self.tile_sequence):
             tile = self.tile_sequence[self.tile_cursor]
             if self.tile_remaining.get(tile, 0) > 0:
@@ -203,6 +243,23 @@ class GreedyMemoryAwareScheduler:
         tile_bonus = self._tile_bonus(nid)
         alloc_priority = self._alloc_priority(node)
         bottom = self.bottom_level.get(nid, 0.0)
+        conv_bonus = 0
+        if self.strategy == "conv":
+            if node.is_free and node.buf_id is not None:
+                if self.buf_types.get(node.buf_id) == "L1":
+                    conv_bonus = self.buf_sizes.get(node.buf_id, 0)
+            elif node.is_alloc and node.buf_id is not None:
+                if self.buf_types.get(node.buf_id) == "L1":
+                    conv_bonus = -self.buf_sizes.get(node.buf_id, 0)
+        flash_bonus = 0
+        if self.strategy == "flashattention" and node.buf_id is not None:
+            buf_type = self.buf_types.get(node.buf_id)
+            if buf_type in {"UB", "L0C", "L1"}:
+                size = self.buf_sizes.get(node.buf_id, node.size)
+                if node.is_free:
+                    flash_bonus = size
+                elif node.is_alloc:
+                    flash_bonus = -size
 
         return (
             -predicted_peak,
@@ -213,6 +270,8 @@ class GreedyMemoryAwareScheduler:
             class_rank,
             tile_bonus,
             alloc_priority,
+            conv_bonus,
+            flash_bonus,
             bottom,
             -node.id,
         )
@@ -334,6 +393,83 @@ class GreedyMemoryAwareScheduler:
         if self.strategy == "conv":
             return ("L1",)
         return tuple()
+
+    def _strategy_slack_factor(self) -> float:
+        if self.strategy == "flashattention":
+            return 0.6
+        if self.strategy == "matmul":
+            return 0.8
+        return 1.0
+
+    def _compute_tile_components(self) -> Dict[int, int]:
+        if not self.tile_types:
+            return {}
+        tile_buffers = [
+            buf_id
+            for buf_id, buf_type in self.buf_types.items()
+            if buf_type in self.tile_types
+        ]
+        if not tile_buffers:
+            return {}
+
+        dsu = DisjointSet()
+        for buf_id in tile_buffers:
+            dsu.find(buf_id)
+
+        for node in self.graph.nodes.values():
+            buffers = [
+                buf
+                for buf in self._node_buffers(node)
+                if self.buf_types.get(buf) in self.tile_types
+            ]
+            if len(buffers) < 2:
+                continue
+            base = buffers[0]
+            for other in buffers[1:]:
+                dsu.union(base, other)
+
+        return {buf: dsu.find(buf) for buf in tile_buffers}
+
+    def _propagate_tile_ids(self, assignment: Dict[int, int]) -> Dict[int, int]:
+        if not assignment:
+            return assignment
+        queue: List[int] = list(assignment.keys())
+        while queue:
+            buf = queue.pop()
+            tile = assignment[buf]
+            for node_id in self.buffer_users.get(buf, []):
+                node = self.graph.nodes[node_id]
+                for other in self._node_buffers(node):
+                    if other not in assignment:
+                        assignment[other] = tile
+                        queue.append(other)
+        return assignment
+
+    def _compute_tile_sizes(self) -> Dict[int, int]:
+        sizes: Dict[int, int] = {}
+        if not self.tile_types:
+            return sizes
+        for buf_id, size in self.buf_sizes.items():
+            buf_type = self.buf_types.get(buf_id)
+            if buf_type in self.tile_types:
+                tile = self.tile_of_buf.get(buf_id, buf_id)
+                sizes[tile] = sizes.get(tile, 0) + size
+        return sizes
+
+    def _select_conv_mode(self) -> Optional[str]:
+        if self.strategy != "conv" or not self.tile_sizes:
+            return None
+        sizes = list(self.tile_sizes.values())
+        if not sizes:
+            return None
+        max_size = max(sizes)
+        min_size = min(sizes)
+        ratio = max_size / max(1, min_size)
+        if ratio > 4:
+            return "breadth"
+        if ratio < 1.5:
+            return "depth"
+        return "breadth"
 
     def _infer_tile(self, node: Node) -> Optional[int]:
         if not self.tile_types:

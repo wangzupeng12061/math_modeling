@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from .data import Graph, load_graph
 from .memory import MemoryPlanner, MemoryPlan
@@ -26,6 +26,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=Path("outputs/p1"),
         help="Directory to place schedule file",
     )
+    schedule_parser.add_argument(
+        "--trace",
+        type=Path,
+        default=None,
+        help="Optional path to write residency trace CSV",
+    )
 
     memory_parser = subparsers.add_parser(
         "memory", help="Allocate buffers with spills (problem 2)."
@@ -37,6 +43,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=Path,
         default=Path("outputs/p2"),
         help="Directory to place memory planning outputs",
+    )
+    memory_parser.add_argument(
+        "--trace",
+        type=Path,
+        default=None,
+        help="Optional path to write residency trace CSV",
     )
 
     optimize_parser = subparsers.add_parser(
@@ -56,6 +68,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=0.05,
         help="Maximum relative increase in extra data movement allowed",
     )
+    optimize_parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to dump residency traces (baseline / chosen)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -66,6 +84,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.name,
             strategy=args.strategy,
             capacity_slack=args.capacity_slack,
+            trace_path=args.trace,
         )
     if args.command == "memory":
         return command_memory(
@@ -74,6 +93,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.name,
             strategy=args.strategy,
             capacity_slack=args.capacity_slack,
+            trace_path=args.trace,
         )
     if args.command == "optimize":
         return command_optimize(
@@ -83,6 +103,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.movement_tolerance,
             strategy=args.strategy,
             capacity_slack=args.capacity_slack,
+            trace_dir=args.trace_dir,
         )
 
     parser.error(f"Unknown command {args.command}")
@@ -122,6 +143,7 @@ def command_schedule(
     *,
     strategy: str,
     capacity_slack: float,
+    trace_path: Optional[Path],
 ) -> int:
     graph = _load_graph_or_exit(graph_path)
     scheduler = _make_scheduler(graph, strategy, capacity_slack)
@@ -133,6 +155,9 @@ def command_schedule(
     with schedule_path.open("w", encoding="utf-8") as fh:
         for nid in result.order:
             fh.write(f"{nid}\n")
+
+    if trace_path is not None:
+        _write_trace(trace_path, result.residency_trace)
 
     print(
         f"[problem1] Schedule written to {schedule_path} (max resident: {result.max_resident})"
@@ -147,6 +172,7 @@ def command_memory(
     *,
     strategy: str,
     capacity_slack: float,
+    trace_path: Optional[Path],
 ) -> int:
     graph = _load_graph_or_exit(graph_path)
     scheduler = _make_scheduler(graph, strategy, capacity_slack)
@@ -158,6 +184,9 @@ def command_memory(
     task_name = name or graph_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_memory_outputs(task_name, output_dir, plan)
+
+    if trace_path is not None:
+        _write_trace(trace_path, schedule_result.residency_trace)
 
     print(
         "[problem2] Outputs written to"
@@ -177,6 +206,7 @@ def command_optimize(
     *,
     strategy: str,
     capacity_slack: float,
+    trace_dir: Optional[Path],
 ) -> int:
     graph = _load_graph_or_exit(graph_path)
     task_name = name or graph_path.stem
@@ -204,6 +234,17 @@ def command_optimize(
         chosen_plan = optimized_plan
         chosen_timeline = optimized
         strategy = "optimized"
+
+    if trace_dir is not None:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        baseline_trace_path = trace_dir / f"{task_name}_baseline_trace.csv"
+        _write_trace(baseline_trace_path, baseline_schedule.residency_trace)
+        chosen_trace_path = trace_dir / f"{task_name}_{strategy}_trace.csv"
+        if strategy == "baseline":
+            _write_trace(chosen_trace_path, baseline_schedule.residency_trace)
+        else:
+            chosen_trace = _compute_trace(graph, chosen_order)
+            _write_trace(chosen_trace_path, chosen_trace)
 
     _write_memory_outputs(task_name, output_dir, chosen_plan)
 
@@ -243,6 +284,27 @@ def _make_scheduler(graph: Graph, strategy: str, capacity_slack: float) -> Greed
         strategy=strategy,
     )
     return GreedyMemoryAwareScheduler(graph, config=config)
+
+
+def _write_trace(path: Path, trace: List[Tuple[int, int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("step,node_id,resident\n")
+        for idx, (nid, resident) in enumerate(trace):
+            fh.write(f"{idx},{nid},{resident}\n")
+
+
+def _compute_trace(graph: Graph, order: List[int]) -> List[Tuple[int, int]]:
+    resident = 0
+    trace: List[Tuple[int, int]] = []
+    for nid in order:
+        node = graph.nodes[nid]
+        if node.is_alloc:
+            resident += node.size
+        elif node.is_free:
+            resident -= node.size
+        trace.append((nid, resident))
+    return trace
 
 
 def _write_memory_outputs(task_name: str, output_dir: Path, plan: MemoryPlan) -> None:
