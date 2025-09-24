@@ -116,6 +116,8 @@ class GreedyMemoryAwareScheduler:
         self.tile_cursor = 0
         self.tile_sizes: Dict[int, int] = self._compute_tile_sizes()
         self.conv_mode: Optional[str] = self._select_conv_mode()
+        self.max_active_tiles: Optional[int] = self._max_active_tiles_for_strategy()
+        self.active_tiles: set[int] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -198,7 +200,14 @@ class GreedyMemoryAwareScheduler:
         current_resident: int,
         current_tile: Optional[int],
     ) -> List[int]:
-        if self.strategy == "conv":
+        if self.strategy == "conv" and self.conv_mode == "depth" and current_tile is not None:
+            tile_candidates = [
+                nid
+                for nid in ready
+                if self.node_tile.get(nid) == current_tile or self.graph.nodes[nid].is_free
+            ]
+            if tile_candidates:
+                return tile_candidates
             return ready
         if current_tile is None:
             return ready
@@ -247,19 +256,21 @@ class GreedyMemoryAwareScheduler:
         if self.strategy == "conv":
             if node.is_free and node.buf_id is not None:
                 if self.buf_types.get(node.buf_id) == "L1":
-                    conv_bonus = self.buf_sizes.get(node.buf_id, 0)
+                    conv_bonus = self.buf_sizes.get(node.buf_id, 0) * 2
             elif node.is_alloc and node.buf_id is not None:
                 if self.buf_types.get(node.buf_id) == "L1":
-                    conv_bonus = -self.buf_sizes.get(node.buf_id, 0)
+                    conv_bonus = -self.buf_sizes.get(node.buf_id, 0) * 2
         flash_bonus = 0
         if self.strategy == "flashattention" and node.buf_id is not None:
             buf_type = self.buf_types.get(node.buf_id)
             if buf_type in {"UB", "L0C", "L1"}:
                 size = self.buf_sizes.get(node.buf_id, node.size)
                 if node.is_free:
-                    flash_bonus = size
+                    weight = 4 if buf_type == "UB" else 2
+                    flash_bonus = size * weight
                 elif node.is_alloc:
-                    flash_bonus = -size
+                    weight = 4 if buf_type == "UB" else 2
+                    flash_bonus = -size * weight
 
         return (
             -predicted_peak,
@@ -333,6 +344,14 @@ class GreedyMemoryAwareScheduler:
             return True
         if self.global_limit is not None and (self.total_usage + node.size) > self.global_limit:
             return True
+        tile = self.node_tile.get(node.id) if isinstance(node.id, int) else None
+        if (
+            self.max_active_tiles is not None
+            and tile is not None
+            and tile not in self.active_tiles
+            and len(self.active_tiles) >= self.max_active_tiles
+        ):
+            return True
         return False
 
     def _apply_alloc(self, node: Node) -> None:
@@ -368,6 +387,8 @@ class GreedyMemoryAwareScheduler:
 
         tile = self.node_tile.get(nid)
         if tile is not None:
+            if tile not in self.active_tiles:
+                self.active_tiles.add(tile)
             remaining = self.tile_remaining.get(tile, 0)
             if remaining > 0:
                 remaining -= 1
@@ -377,6 +398,7 @@ class GreedyMemoryAwareScheduler:
                         self.focus_tile = None
                     if self.tile_cursor < len(self.tile_sequence) and self.tile_sequence[self.tile_cursor] == tile:
                         self.tile_cursor += 1
+                    self.active_tiles.discard(tile)
                 else:
                     self.tile_remaining[tile] = remaining
             if not node.is_alloc and not node.is_free:
@@ -396,14 +418,24 @@ class GreedyMemoryAwareScheduler:
 
     def _strategy_slack_factor(self) -> float:
         if self.strategy == "flashattention":
-            return 0.6
+            return 0.3
         if self.strategy == "matmul":
             return 0.8
         return 1.0
 
+    def _max_active_tiles_for_strategy(self) -> Optional[int]:
+        if self.strategy == "flashattention":
+            return 1
+        return None
+
     def _compute_tile_components(self) -> Dict[int, int]:
         if not self.tile_types:
             return {}
+        if self.strategy == "flashattention":
+            return self._compute_flash_tiles()
+        if self.strategy == "conv":
+            return self._compute_conv_tiles()
+
         tile_buffers = [
             buf_id
             for buf_id, buf_type in self.buf_types.items()
@@ -429,6 +461,99 @@ class GreedyMemoryAwareScheduler:
                 dsu.union(base, other)
 
         return {buf: dsu.find(buf) for buf in tile_buffers}
+
+    def _compute_conv_tiles(self) -> Dict[int, int]:
+        l1_buffers = [
+            buf_id
+            for buf_id, buf_type in self.buf_types.items()
+            if buf_type == "L1"
+        ]
+        if not l1_buffers:
+            return {}
+
+        dsu = DisjointSet()
+        for buf_id in l1_buffers:
+            dsu.find(buf_id)
+
+        for node in self.graph.nodes.values():
+            buffers = [
+                buf
+                for buf in self._node_buffers(node)
+                if self.buf_types.get(buf) == "L1"
+            ]
+            if len(buffers) < 2:
+                continue
+            base = buffers[0]
+            for other in buffers[1:]:
+                dsu.union(base, other)
+
+        groups: Dict[int, List[int]] = {}
+        for buf in l1_buffers:
+            groups.setdefault(dsu.find(buf), []).append(buf)
+
+        capacity = self.capacities.get("L1", 4096)
+        threshold = max(1024, capacity // 4)
+
+        assignment: Dict[int, int] = {}
+        for _, buffers in groups.items():
+            buffers.sort(key=lambda b: self.buf_alloc_index.get(b, b))
+            current_tile = buffers[0]
+            current_size = 0
+            for buf in buffers:
+                size = self.buf_sizes.get(buf, 0)
+                if current_size + size > threshold and current_size > 0:
+                    current_tile = buf
+                    current_size = 0
+                assignment[buf] = current_tile
+                current_size += size
+
+        return assignment
+
+    def _compute_flash_tiles(self) -> Dict[int, int]:
+        ub_allocs = [
+            (self.buf_alloc_index.get(buf_id, buf_id), buf_id)
+            for buf_id, buf_type in self.buf_types.items()
+            if buf_type == "UB"
+        ]
+        if not ub_allocs:
+            return {}
+        ub_allocs.sort()
+
+        threshold = max(256, int(self.capacities.get("UB", 1024) * 0.25))
+        assignment: Dict[int, int] = {}
+        current_tile = ub_allocs[0][1]
+        current_size = 0
+        previous_buf: Optional[int] = None
+
+        for _, buf_id in ub_allocs:
+            size = self.buf_sizes.get(buf_id, 0)
+            if previous_buf is not None:
+                gap = buf_id - previous_buf
+                if gap > 4 and current_size > 0:
+                    current_tile = buf_id
+                    current_size = 0
+            if current_size + size > threshold and current_size > 0:
+                current_tile = buf_id
+                current_size = 0
+            assignment[buf_id] = current_tile
+            current_size += size
+            previous_buf = buf_id
+
+        # Attach dependent buffers (L0A/B/C, L1) to their UB tile when they co-occur.
+        attach_types = {"L0A", "L0B", "L0C", "L1"}
+        for node in self.graph.nodes.values():
+            buffers = self._node_buffers(node)
+            tile_candidates = [assignment[buf] for buf in buffers if buf in assignment]
+            if not tile_candidates:
+                continue
+            tile = tile_candidates[0]
+            for buf in buffers:
+                if buf in assignment:
+                    continue
+                if self.buf_types.get(buf) in attach_types:
+                    assignment[buf] = tile
+
+        return assignment
 
     def _propagate_tile_ids(self, assignment: Dict[int, int]) -> Dict[int, int]:
         if not assignment:
@@ -466,8 +591,6 @@ class GreedyMemoryAwareScheduler:
         min_size = min(sizes)
         ratio = max_size / max(1, min_size)
         if ratio > 4:
-            return "breadth"
-        if ratio < 1.5:
             return "depth"
         return "breadth"
 

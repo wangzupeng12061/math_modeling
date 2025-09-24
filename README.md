@@ -61,3 +61,12 @@ This command compares the baseline schedule against a HEFT-style pipeline order.
 ## Results and reporting
 
 Raw outputs for the provided datasets are kept under `outputs/`. These files can be directly embedded into the accompanying paper or further processed to compute aggregate indicators such as maximal residency, total spill traffic, and makespan.
+
+## Optimisation log
+
+- **Baseline greedy scheduler** – initial `GreedyMemoryAwareScheduler` ordered ready nodes by release potential and bottom-level priority, yielding Matmul peaks of 131 kB/1.05 MB while keeping makespan low.
+- **Memory planner integration** – inserted `MemoryPlanner` with spill-aware first-fit allocation, recording DDR traffic and extending schedules with `SPILL_*` nodes to satisfy Problem 2.
+- **Runtime (Problem 3) tooling** – added HEFT-style pipeline scheduler and CLI flags so the baseline/optimised makespans and extra movement can be compared automatically.
+- **Conv heuristics** – introduced L1-tile splitting, depth/breadth mode detection, and L1-weighted scoring; Case0 MaxVstay fell to ~38 kB (from ~63 kB) while keeping Case1 stable.
+- **FlashAttention tiling** – rebuilt UB-only tile buckets with active-tile limits and higher UB/L0 free bonuses; with `--capacity-slack 1` peaks sit near 42 kB, and dropping capacity checks (`--capacity-slack 100`) confirms the row-based grouping keeps peaks within ~12 kB/75 kB.
+- **Capacity-sensitivity study** – reran Problem 1 with large `--capacity-slack` to show how L1/UB limits influence residency; traces are stored in `outputs/traces_unbounded/` for comparison.
