@@ -8,15 +8,7 @@ from typing import Optional
 from .data import Graph, load_graph
 from .memory import MemoryPlanner, MemoryPlan
 from .runtime import HeftPipelineScheduler, simulate_timeline
-from .scheduler import GreedyMemoryAwareScheduler
-
-DEFAULT_CAPACITIES = {
-    "L1": 4096,
-    "UB": 1024,
-    "L0A": 256,
-    "L0B": 256,
-    "L0C": 512,
-}
+from .scheduler import GreedyMemoryAwareScheduler, SchedulerConfig, DEFAULT_CAPACITIES
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -27,6 +19,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "schedule", help="Compute a memory-aware schedule (problem 1)."
     )
     _add_common_graph_args(schedule_parser)
+    _add_scheduler_args(schedule_parser)
     schedule_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -38,6 +31,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "memory", help="Allocate buffers with spills (problem 2)."
     )
     _add_common_graph_args(memory_parser)
+    _add_scheduler_args(memory_parser)
     memory_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -49,6 +43,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "optimize", help="Pipeline optimization with runtime focus (problem 3)."
     )
     _add_common_graph_args(optimize_parser)
+    _add_scheduler_args(optimize_parser)
     optimize_parser.add_argument(
         "--output-dir",
         type=Path,
@@ -65,11 +60,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "schedule":
-        return command_schedule(args.graph, args.output_dir, args.name)
+        return command_schedule(
+            args.graph,
+            args.output_dir,
+            args.name,
+            strategy=args.strategy,
+            capacity_slack=args.capacity_slack,
+        )
     if args.command == "memory":
-        return command_memory(args.graph, args.output_dir, args.name)
+        return command_memory(
+            args.graph,
+            args.output_dir,
+            args.name,
+            strategy=args.strategy,
+            capacity_slack=args.capacity_slack,
+        )
     if args.command == "optimize":
-        return command_optimize(args.graph, args.output_dir, args.name, args.movement_tolerance)
+        return command_optimize(
+            args.graph,
+            args.output_dir,
+            args.name,
+            args.movement_tolerance,
+            strategy=args.strategy,
+            capacity_slack=args.capacity_slack,
+        )
 
     parser.error(f"Unknown command {args.command}")
     return 1
@@ -85,9 +99,32 @@ def _add_common_graph_args(subparser: argparse.ArgumentParser) -> None:
     )
 
 
-def command_schedule(graph_path: Path, output_dir: Path, name: Optional[str]) -> int:
+def _add_scheduler_args(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--strategy",
+        type=str,
+        default="auto",
+        choices=["auto", "generic", "matmul", "flashattention", "conv"],
+        help="Scheduling heuristic strategy (auto-detect by default)",
+    )
+    subparser.add_argument(
+        "--capacity-slack",
+        type=float,
+        default=1.0,
+        help="Multiplier applied to cache capacities when scheduling (>=0)",
+    )
+
+
+def command_schedule(
+    graph_path: Path,
+    output_dir: Path,
+    name: Optional[str],
+    *,
+    strategy: str,
+    capacity_slack: float,
+) -> int:
     graph = _load_graph_or_exit(graph_path)
-    scheduler = GreedyMemoryAwareScheduler(graph)
+    scheduler = _make_scheduler(graph, strategy, capacity_slack)
     result = scheduler.run()
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -103,9 +140,16 @@ def command_schedule(graph_path: Path, output_dir: Path, name: Optional[str]) ->
     return 0
 
 
-def command_memory(graph_path: Path, output_dir: Path, name: Optional[str]) -> int:
+def command_memory(
+    graph_path: Path,
+    output_dir: Path,
+    name: Optional[str],
+    *,
+    strategy: str,
+    capacity_slack: float,
+) -> int:
     graph = _load_graph_or_exit(graph_path)
-    scheduler = GreedyMemoryAwareScheduler(graph)
+    scheduler = _make_scheduler(graph, strategy, capacity_slack)
     schedule_result = scheduler.run()
 
     planner = MemoryPlanner(graph, schedule_result.order, DEFAULT_CAPACITIES)
@@ -130,13 +174,16 @@ def command_optimize(
     output_dir: Path,
     name: Optional[str],
     tolerance: float,
+    *,
+    strategy: str,
+    capacity_slack: float,
 ) -> int:
     graph = _load_graph_or_exit(graph_path)
     task_name = name or graph_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Baseline (problem 1) schedule metrics.
-    baseline_scheduler = GreedyMemoryAwareScheduler(graph)
+    baseline_scheduler = _make_scheduler(graph, strategy, capacity_slack)
     baseline_schedule = baseline_scheduler.run()
     baseline_plan = MemoryPlanner(graph, baseline_schedule.order, DEFAULT_CAPACITIES).plan()
     baseline_timeline = simulate_timeline(graph, baseline_schedule.order)
@@ -186,6 +233,16 @@ def command_optimize(
         )
     )
     return 0
+
+
+def _make_scheduler(graph: Graph, strategy: str, capacity_slack: float) -> GreedyMemoryAwareScheduler:
+    slack = capacity_slack if capacity_slack > 0 else 1.0
+    config = SchedulerConfig(
+        capacities=dict(DEFAULT_CAPACITIES),
+        capacity_slack=slack,
+        strategy=strategy,
+    )
+    return GreedyMemoryAwareScheduler(graph, config=config)
 
 
 def _write_memory_outputs(task_name: str, output_dir: Path, plan: MemoryPlan) -> None:
