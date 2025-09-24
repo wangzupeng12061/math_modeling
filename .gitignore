@@ -1,2 +1,40 @@
+# IDE and editor settings
 .vscode/
+.idea/
+
+# macOS Finder artifacts
 .DS_Store
+
+# Python cache and bytecode files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment directories
+.venv/
+.env/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+
+# Coverage and profiling outputs
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated experiment outputs
+outputs/
+results/
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
